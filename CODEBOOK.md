@@ -106,12 +106,3 @@ removed, so not every AU × feature combination is present.
 | `AUxx_r_duration` | Duration of the closest peak | `AUxx_r_amplitude` |
 | `AUxx_r_rise_slope` | `height / (position − peak_start)`: mean speed of the rising phase | `AUxx_r_speed` |
 
-## Questionnaires (`data/raw/Questionnaires.xlsm`, sheet "Rep total")
-
-| Variable | Description |
-|---|---|
-| `participant` | Participant code (= `ID`) |
-| `age` | Age (years) |
-| `humeur` | Current mood |
-| `TEIQue` | Trait Emotional Intelligence Questionnaire, global score |
-| `QPI focus`, `QPI implication`, `QPI emotion` | Immersive Tendencies Questionnaire (French version, QPI): focus, involvement, emotion |
