@@ -2,7 +2,7 @@
 
 R code for the article:
 
-> Rogez, L., et al.  *Beyond peak intensity* .
+XX, X., et al.  *Beyond peak intensity* .
 
 The study asks whether emotions elicited by film clips can be distinguished not only
 by **how intense** facial movements are (peak height), but also by their **dynamics**:
@@ -116,4 +116,4 @@ scripts 02–04: they are renamed automatically by `harmonise_names()`
 
 ## Contact
 
-Laurie Rogez — laurie.rogez@univ-reims.fr
+XX — XX@XX.fr
