@@ -6,8 +6,8 @@
 #   (b) the machine-learning dataset linking each subjective rating to the
 #       closest AU peaks                -> data/processed/ml_dataset.csv
 #
-# Project : Beyond peak intensity (Rogez et al.)
-# Author  : Laurie Rogez, Nicolas Stefaniak, Ali Oker, Pamela Gobin, Sylvain Caruana, Stéphanie Caillies
+# Project : Beyond peak intensity (XX et al.)
+# Author  : XX, XX, XX, ...
 # Language: R (>= 4.2)
 #
 # -----------------------------------------------------------------------------
