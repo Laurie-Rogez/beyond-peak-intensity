@@ -11,8 +11,8 @@
 # Input : data/processed/peaks.csv          (created by 01_preprocessing.R)
 # Output: outputs/figures/*.png, outputs/tables/*.csv
 #
-# Project : Beyond peak intensity (Rogez et al.)
-# Author  : Laurie Rogez, Nicolas Stefaniak, Ali Oker, Pamela Gobin, Sylvain Caruana, Stéphanie Caillies
+# Project : Beyond peak intensity (XX et al.)
+# Author  : XX, XX, XX, ...
 # =============================================================================
 
 
