@@ -1,0 +1,563 @@
+---
+title: "Beyond peak intensity: classifying emotions from the dynamics of facial Action Units"
+subtitle: "Machine learning analyses (Random Forest & C5.0)"
+author: "Laurie Rogez, Nicolas Stefaniak, Ali Oker, Pamela Gobin, Sylvain Caruana, Stéphanie Caillies"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+  word_document:
+    toc: true
+    number_sections: true
+bibliography: references.bib
+link-citations: yes
+csl: apa.csl
+---
+
+```{r setup, include=FALSE}
+# Global chunk options
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 7, fig.height = 5, fig.align = "center"
+)
+set.seed(123)
+options(scipen = 999)
+```
+
+# About this document {-}
+
+**Question.** Can the emotion elicited by a clip be recognised from the
+*dynamics* of the facial Action Units (AUs) — not only how high AU peaks are,
+but also how long they last and how fast they rise?
+
+**Data.** One observation = one subjective intensity rating given by a
+participant during a clip. For each of the 17 AUs, the predictors describe the
+AU peak that was closest in time to the rating (see `01_preprocessing.R`,
+steps 12–13):
+
+| Feature suffix | Meaning |
+|---|---|
+| `_height` | peak height (maximum intensity, baseline-corrected) |
+| `_duration` | peak duration in frames (end − start) |
+| `_rise_slope` | height / (top − start): mean speed of the rising phase |
+
+The outcome is the emotion category of the clip (10 classes).
+
+**Procedure.**
+
+1. 75 % / 25 % stratified split into a training set and an independent
+   hold-out test set.
+2. Random Forest [ranger, @ranger] and C5.0 decision trees / rules
+   [@C50] trained with the caret package [@caret]; hyperparameters tuned with
+   5-fold cross-validation repeated twice (5 × 2 CV) on the training set.
+3. Evaluation on the hold-out test set (accuracy, confusion matrices).
+4. Interpretation: variable importance (both models) and decision rules (C5.0).
+
+**Important:** the order of the chunks must not be changed. Several steps use
+random numbers (data split, forests, cross-validation folds): the results of
+the article are reproduced only when the chunks are run in this order.
+
+## Data analyses (text for the Methods section) {-}
+
+Data analyses were conducted using R version 4.2.3 [@Rcore] within the RStudio
+environment [@Rstudio]. All analyses were implemented using literate
+programming [i.e., @rmarkdown]. Machine learning procedures were carried out
+with the caret package [@caret], relying on the ranger algorithm for Random
+Forest classification [@ranger] and the C5.0 algorithm for decision tree and
+rule-based modelling [@C50]. Model training and evaluation were performed with
+a 5 × 2 repeated cross-validation procedure and an independent 25 % hold-out
+test set. Graphical visualisations were produced using the ggplot2 package
+[@ggplot2].
+
+
+# Setup
+
+```{r packages}
+source(here::here("R", "00_setup.R"))
+
+library(caret)       # unified interface for training / tuning models
+library(ranger)      # fast Random Forest
+library(C50)         # C5.0 decision trees and rules
+library(doParallel)  # parallel cross-validation
+library(foreach)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(MLmetrics)   # multi-class metrics used by caret::multiClassSummary
+
+save_figure <- function(plot, file, width = 8, height = 6, dpi = 600) {
+  ggsave(file.path(paths$figures, file), plot = plot,
+         width = width, height = height, dpi = dpi)
+}
+save_table <- function(df, file) {
+  write.csv(df, file.path(paths$tables, file), row.names = FALSE)
+}
+```
+
+# Data
+
+## Import
+
+```{r import}
+data_path <- file.path(paths$processed, "ml_dataset.csv")
+if (!file.exists(data_path)) {
+  stop("File not found: ", data_path, "\nRun 01_preprocessing.R first.")
+}
+
+ml_raw <- read.csv(data_path, sep = ";", dec = ",", stringsAsFactors = FALSE) %>%
+  harmonise_names()   # accepts the original file with French column names
+
+str(ml_raw, list.len = 10)
+table(ml_raw$condition)
+```
+
+## Selection of the predictors
+
+Predictors = height, duration and rise slope of each AU's closest peak. The
+time position of the peak (`_position`) and the identifiers are **not** used.
+
+```{r predictors}
+predictors <- grep("_(height|duration|rise_slope)$", names(ml_raw), value = TRUE)
+length(predictors)
+
+# Consistency check with the original analysis, in which predictors were
+# selected by column position (columns 7:23 and 41:69 of the original file,
+# recognisable by its first unnamed column "X").
+if ("X" %in% names(ml_raw)) {
+  legacy_idx <- c(7:23, 41:69)
+  legacy <- names(ml_raw)[legacy_idx[legacy_idx <= ncol(ml_raw)]]
+  if (!setequal(predictors, legacy)) {
+    warning("Name-based and original index-based predictor sets differ:\n",
+            "  only in name-based : ", paste(setdiff(predictors, legacy), collapse = ", "), "\n",
+            "  only in index-based: ", paste(setdiff(legacy, predictors), collapse = ", "))
+  }
+}
+```
+
+## Preparation
+
+```{r preparation}
+df <- ml_raw[, c("ID", "Clip", "condition", predictors)]
+df <- na.omit(df)
+
+df$condition <- translate_emotions(df$condition)   # French -> English, ordered
+df$ID   <- as.factor(df$ID)
+df$Clip <- as.factor(df$Clip)
+
+dim(df)
+length(unique(df$ID))     # participants
+length(unique(df$Clip))   # clips
+
+p_classes <- ggplot(df, aes(x = condition)) +
+  geom_bar() +
+  theme_minimal() +
+  labs(x = "Emotion category", y = "Number of observations",
+       title = "Class distribution") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+p_classes
+save_figure(p_classes, "Distribution_Class.png")
+```
+
+## Train / test split (75 % / 25 %)
+
+`createDataPartition()` samples within each emotion, so that both sets have
+the same class proportions (stratified split).
+
+```{r split}
+set.seed(123)
+train_indices <- caret::createDataPartition(df$condition, p = 0.75, list = FALSE)
+train_data <- df[train_indices, ]
+test_data  <- df[-train_indices, ]
+
+# Identifiers are removed from the predictors (they are not facial features)
+train_x <- train_data %>% select(-ID, -Clip)
+test_x  <- test_data  %>% select(-ID, -Clip)
+
+nrow(train_x)
+nrow(test_x)
+round(prop.table(table(train_x$condition)), 3)
+round(prop.table(table(test_x$condition)), 3)
+```
+
+> **Note on independence.** The split is made at the level of observations:
+> the same participant (and the same clip) can appear in both the training and
+> the test sets.
+
+
+# Random Forest
+
+## Initial model (default settings)
+
+A first forest of 1000 trees, with 2 candidate predictors per split
+(`mtry = 2`).
+
+```{r rf-initial}
+model_ranger <- ranger(
+  condition ~ ., data = train_x,
+  num.trees = 1000, mtry = 2,
+  importance = "impurity", probability = TRUE
+)
+
+# Predicted class = the class with the highest predicted probability
+pred <- predict(model_ranger, data = test_x)
+pred_classes <- factor(
+  colnames(pred$predictions)[apply(pred$predictions, 1, which.max)],
+  levels = levels(train_x$condition)
+)
+
+cm_rf_initial <- caret::confusionMatrix(pred_classes, test_x$condition)
+cm_rf_initial
+
+p_cm <- ggplot(as.data.frame(cm_rf_initial$table),
+               aes(x = Prediction, y = Reference, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), size = 3) +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  theme_minimal() +
+  labs(title = "Confusion matrix \u2013 Random Forest",
+       x = "Predicted emotion", y = "True emotion") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+p_cm
+save_figure(p_cm, "Figure_confusion_matrix.png")
+```
+
+## Variable importance
+
+Importance = mean decrease in Gini impurity: how much, on average, splits on
+a variable make the tree nodes "purer" (more homogeneous in emotion).
+
+```{r rf-importance, fig.width=7, fig.height=6}
+imp <- sort(model_ranger$variable.importance, decreasing = TRUE)
+imp_df <- data.frame(Variable = names(imp), Importance = as.numeric(imp))
+
+# Readable labels, e.g. "AU12 (Lip corner puller) – height"
+feature_labels <- c(height = "height", duration = "duration", rise_slope = "rise slope")
+imp_df <- imp_df %>%
+  mutate(
+    AU      = sub("^(AU[0-9]{2}).*$", "\\1", Variable),
+    feature = feature_labels[sub("^AU[0-9]{2}_r_", "", Variable)],
+    Label   = paste0(AU, " (", au_names[AU], ") \u2013 ", feature)
+  ) %>%
+  filter(is.finite(Importance)) %>%
+  arrange(desc(Importance))
+
+imp_top <- head(imp_df, 20)
+
+p_imp <- ggplot(imp_top, aes(x = reorder(Label, Importance), y = Importance)) +
+  geom_col() +
+  coord_flip() +
+  geom_text(aes(label = round(Importance, 2)), hjust = -0.1, size = 3) +
+  labs(title = "Top variable importance scores (Random Forest)",
+       x = NULL, y = "Variable importance (Gini impurity)") +
+  theme_minimal(base_size = 11) +
+  expand_limits(y = max(imp_top$Importance) * 1.1)
+p_imp
+save_figure(p_imp, "importance_scores.png")
+```
+
+## Tuning with 5 × 2 cross-validation
+
+The training set is split into 5 folds; each fold is used once for
+validation while the model is trained on the 4 others; the whole procedure is
+repeated twice. We tune `min.node.size` (minimum number of observations in a
+terminal node: small values = deeper trees).
+
+```{r rf-cv-setup}
+# Parallel computing (one core is left free)
+cl <- parallel::makeCluster(max(1L, parallel::detectCores() - 1L))
+doParallel::registerDoParallel(cl)
+
+fitControl <- caret::trainControl(
+  method = "repeatedcv", number = 5, repeats = 2,
+  classProbs = TRUE,
+  summaryFunction = caret::multiClassSummary,
+  allowParallel = TRUE
+)
+
+tuneGrid <- expand.grid(
+  mtry = 2,
+  splitrule = "gini",
+  min.node.size = c(1, 5, 10)
+)
+```
+
+```{r rf-cv-train}
+set.seed(123)
+model_rf_cv <- caret::train(
+  condition ~ ., data = train_x,
+  method = "ranger",
+  trControl = fitControl,
+  tuneGrid = tuneGrid,
+  num.trees = 500,
+  importance = "none",
+  respect.unordered.factors = "order"
+)
+
+model_rf_cv   # performance averaged over the 10 validation folds
+
+ggplot(model_rf_cv$results, aes(x = factor(min.node.size), y = Accuracy, group = 1)) +
+  geom_line() + geom_point(size = 2) +
+  labs(x = "min.node.size", y = "CV accuracy (mean)",
+       title = "Random Forest \u2014 cross-validation results") +
+  theme_minimal(base_size = 11)
+```
+
+## Evaluation on the hold-out test set (25 %)
+
+```{r rf-test}
+pred_rf_cv <- predict(model_rf_cv, newdata = test_x)
+cm_rf_cv <- caret::confusionMatrix(pred_rf_cv, test_x$condition)
+cm_rf_cv
+
+# Confusion matrix normalised by true class (each row sums to 100 %)
+cm_norm <- as.data.frame(cm_rf_cv$table) %>%
+  group_by(Reference) %>%
+  mutate(Percent = Freq / sum(Freq)) %>%
+  ungroup()
+
+p_cm_norm <- ggplot(cm_norm, aes(x = Prediction, y = Reference, fill = Percent)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = sprintf("%.1f%%", Percent * 100)), size = 3) +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  theme_minimal(base_size = 12) +
+  labs(title = "Normalized confusion matrix \u2013 Random Forest classifier",
+       x = "Predicted emotion", y = "True emotion", fill = "Proportion") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+p_cm_norm
+save_figure(p_cm_norm, "Figure_RF_confusion_matrix_normalized.png")
+```
+
+## Final refit with the best hyperparameters (variable importance)
+
+```{r rf-final}
+best <- model_rf_cv$bestTune
+
+rf_final <- ranger::ranger(
+  condition ~ ., data = train_x,
+  num.trees = 1000,
+  mtry = best$mtry,
+  splitrule = as.character(best$splitrule),
+  min.node.size = best$min.node.size,
+  importance = "impurity",
+  respect.unordered.factors = "order",
+  seed = 123
+)
+```
+
+
+# C5.0
+
+C5.0 builds decision trees (or sets of rules) that are directly readable,
+which makes the classification easier to interpret than a Random Forest.
+
+## Baseline model (caret default grid)
+
+```{r c50-baseline}
+model_c50_default <- caret::train(
+  condition ~ ., data = train_x,
+  method = "C5.0",
+  trControl = fitControl       # same 5 × 2 CV as above
+)
+
+model_c50_default
+model_c50_default$bestTune
+caret::varImp(model_c50_default)
+```
+
+## Tuning with 5 × 2 cross-validation
+
+Tuned hyperparameters:
+
+- `model`: a single tree or a set of rules;
+- `trials`: number of boosting iterations (1 = no boosting);
+- `winnow`: whether uninformative predictors are discarded before fitting.
+
+```{r c50-cv-setup}
+fitControl_c50 <- caret::trainControl(
+  method = "repeatedcv", number = 5, repeats = 2,
+  classProbs = TRUE,
+  summaryFunction = caret::defaultSummary,
+  allowParallel = TRUE
+)
+
+tuneGrid_c50 <- expand.grid(
+  model  = c("tree", "rules"),
+  trials = c(1, 10, 30),
+  winnow = c(TRUE, FALSE)
+)
+```
+
+```{r c50-cv-train}
+set.seed(123)
+model_c50 <- caret::train(
+  condition ~ ., data = train_x,
+  method = "C5.0",
+  trControl = fitControl_c50,
+  tuneGrid = tuneGrid_c50,
+  metric = "Accuracy"
+)
+
+model_c50
+
+# Hold-out test evaluation (25 %)
+pred_c50 <- predict(model_c50, newdata = test_x)
+cm_c50 <- caret::confusionMatrix(pred_c50, test_x$condition)
+cm_c50
+
+# Parallel computing is no longer needed
+parallel::stopCluster(cl)
+foreach::registerDoSEQ()
+```
+
+## Variable importance
+
+For C5.0, importance = percentage of training observations that fall in a
+node where the variable is used to split.
+
+```{r c50-importance}
+vi_c50 <- caret::varImp(model_c50)
+vi_c50
+plot(vi_c50, top = 20)
+
+vi_df <- vi_c50$importance
+vi_df$Variable <- rownames(vi_df)
+vi_df <- head(vi_df[order(vi_df$Overall, decreasing = TRUE), ], 20)
+
+p_vi_c50 <- ggplot(vi_df, aes(x = reorder(Variable, Overall), y = Overall)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Top 20 Variable Importance (C5.0)", x = "Variables", y = "Importance") +
+  theme_minimal()
+p_vi_c50
+save_figure(p_vi_c50, "variable_importance_c50.png", width = 10, height = 6, dpi = 300)
+```
+
+## Decision rules
+
+The printed summary of the final C5.0 model lists its leaves/rules as
+`condition: class (n/errors)`, where `n` is the number of training
+observations covered and `errors` the number misclassified. We extract these
+lines and keep the reliable ones: coverage ≥ 10 observations and error
+rate ≤ 30 %.
+
+```{r c50-rules}
+model_summary <- capture.output(summary(model_c50$finalModel))
+
+rules <- data.frame(rule = grep(": .*\\([0-9.]+", model_summary, value = TRUE)) %>%
+  mutate(
+    class      = str_extract(rule, paste(emotion_order, collapse = "|")),
+    coverage   = as.numeric(str_match(rule, "\\(([0-9.]+)")[, 2]),
+    errors     = as.numeric(str_match(rule, "\\([0-9.]+/([0-9.]+)\\)")[, 2]),
+    errors     = ifelse(is.na(errors), 0, errors),
+    error_rate = errors / coverage
+  )
+
+rules_selected <- rules %>%
+  filter(coverage >= 10, error_rate <= .30) %>%
+  arrange(class, error_rate, desc(coverage))
+rules_selected
+save_table(rules_selected, "C50_selected_rules.csv")
+
+# Three best rules per emotion
+top_rules <- rules_selected %>%
+  group_by(class) %>%
+  arrange(error_rate, desc(coverage)) %>%
+  slice_head(n = 3) %>%
+  ungroup()
+save_table(top_rules, "C50_top_rules_by_emotion.csv")
+
+# How often each AU appears in the selected rules of each emotion (top 5)
+au_frequency <- rules_selected %>%
+  mutate(AU = str_extract_all(rule, "AU[0-9]{2}")) %>%
+  unnest(AU) %>%
+  count(class, AU, sort = TRUE) %>%
+  group_by(class) %>%
+  slice_max(n, n = 5) %>%
+  ungroup()
+save_table(au_frequency, "C50_AU_frequency_by_emotion.csv")
+```
+
+```{r c50-rules-heatmap}
+threshold <- 18   # above this count, labels are printed in white for contrast
+
+p_rules <- ggplot(au_frequency, aes(x = AU, y = class, fill = n)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = n, color = n >= threshold), size = 3) +
+  scale_color_manual(values = c("FALSE" = "black", "TRUE" = "white"), guide = "none") +
+  scale_fill_gradientn(colors = c("#f7f7f7", "#6baed6", "#08306b")) +
+  labs(title = "Frequency of Action Units Across C5.0 Decision Rules",
+       x = "Action Units", y = "Emotion", fill = "Frequency") +
+  theme_minimal(base_size = 14) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(face = "bold"))
+p_rules
+save_figure(p_rules, "heatmap_AU_emotions.png", width = 10, height = 6, dpi = 300)
+```
+
+
+# Model comparison
+
+```{r comparison}
+comparison <- data.frame(
+  Model = c("Random Forest (initial)", "Random Forest (CV-tuned)", "C5.0 (CV-tuned)"),
+  Test_accuracy = round(c(cm_rf_initial$overall["Accuracy"],
+                          cm_rf_cv$overall["Accuracy"],
+                          cm_c50$overall["Accuracy"]), 4)
+)
+comparison
+
+# Five most important variables of each tuned model
+top5_rf  <- names(sort(rf_final$variable.importance, decreasing = TRUE))[1:5]
+top5_c50 <- rownames(vi_c50$importance)[order(-vi_c50$importance$Overall)][1:5]
+```
+
+## Summary of the results {-}
+
+To identify which Action Units (AUs) best discriminate between emotion
+categories, we trained two supervised classifiers: a Random Forest (ranger) and
+a C5.0 decision tree/rule-based model. Both models were trained on 75 % of the
+data and evaluated on an independent 25 % hold-out test set; hyperparameters
+were optimised using 5 × 2 repeated cross-validation. On the hold-out set, the
+Random Forest achieved an accuracy of
+`r round(100 * cm_rf_cv$overall["Accuracy"], 2)` %, while the C5.0 model
+reached `r round(100 * cm_c50$overall["Accuracy"], 2)` %. Within
+cross-validation, the best C5.0 configuration obtained a mean accuracy of
+`r round(100 * max(model_c50$results$Accuracy), 2)` % using the
+`r model_c50$results$model[which.max(model_c50$results$Accuracy)]` setting.
+Overall, both algorithms performed comparably, with the Random Forest offering
+more stable estimates of variable importance, and the C5.0 model providing
+interpretable decision rules. The five most discriminative features were
+`r paste(top5_rf, collapse = ", ")` for the Random Forest model and
+`r paste(top5_c50, collapse = ", ")` for the C5.0 model. The complete set of
+rules and the confusion matrices are presented in Appendix 1.
+
+
+# Appendix 1 {-}
+
+```{r appendix, echo=FALSE}
+cat("### Random Forest (ranger) \u2014 tuned refit\n")
+print(rf_final)
+
+cat("\n### C5.0 \u2014 cross-validated model\n")
+print(summary(model_c50$finalModel))
+
+cat("\n### Confusion matrix \u2014 Random Forest, CV-tuned (hold-out test)\n")
+print(cm_rf_cv)
+
+cat("\n### Confusion matrix \u2014 Random Forest, initial model (hold-out test)\n")
+print(cm_rf_initial)
+
+cat("\n### Confusion matrix \u2014 C5.0 (hold-out test)\n")
+print(cm_c50)
+```
+
+# Session information {-}
+
+```{r session}
+sessionInfo()
+```
+
+# References {-}
