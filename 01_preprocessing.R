@@ -3,11 +3,13 @@
 # From raw webcam (OpenFace) and experiment (PsychoPy) files to:
 #   (a) the dynamic parameters of facial Action Unit (AU) peaks
 #       (height, duration, position) -> data/processed/peaks.csv
+#       and the subset of peaks associated with a subjective rating
+#                                    -> data/processed/peaks_rating_linked.csv
 #   (b) the machine-learning dataset linking each subjective rating to the
 #       closest AU peaks                -> data/processed/ml_dataset.csv
 #
-# Project : Beyond peak intensity (XX et al.)
-# Author  : XX, XX, XX, ...
+# Project : Beyond peak intensity (Rogez et al.)
+# Author  : Laurie Rogez, Nicolas Stefaniak, Ali Oker, Pamela Gobin, Sylvain Caruana, Stéphanie Caillies
 # Language: R (>= 4.2)
 #
 # -----------------------------------------------------------------------------
@@ -25,6 +27,7 @@
 #  Step 10 Smooth the AU signals (rolling means)             -> smoothed_data.csv
 #  Step 11 Detect AU peaks and their dynamic parameters      -> peaks.csv
 #  Step 12 Link each subjective rating to the closest AU peaks
+#                                                            -> peaks_rating_linked.csv
 #  Step 13 Build the machine-learning dataset                -> ml_dataset.csv
 #
 # Each step writes a checkpoint file in data/processed/ and several steps read
@@ -78,10 +81,10 @@ read_openface_file <- function(file) {
   df <- fread(file.path(paths$raw, file), sep = ",", header = TRUE)
   # Some files were saved with ";" as separator: re-read them if needed
   if (ncol(df) == 1) df <- fread(file.path(paths$raw, file), sep = ";", header = TRUE)
-
+  
   path_parts <- str_split_1(str_remove(file, "\\.csv$"), "/")
   name_parts <- str_split_1(path_parts[3], "_")
-
+  
   df$ID        <- path_parts[1]   # participant ID  = first folder
   df$Condition <- name_parts[2]   # condition label = 2nd part of file name
   df
@@ -267,15 +270,15 @@ timeline_list <- list()
 
 for (id in unique(ratings$participant)) {
   for (cond in conditions_fr) {
-
+    
     n_frames_openface <- sum(openface$ID == id & openface$Condition == cond)
     trials <- psychopy %>% filter(participant == id, Condition == cond)
     n_trials <- nrow(trials)
-
+    
     block_duration    <- trials$Intensite.stopped[n_trials] - trials$webcam_start[1]
     n_frames_psychopy <- block_duration * FPS
     n_not_recorded    <- (n_frames_psychopy + 150) - n_frames_openface
-
+    
     # (1) Frames not recorded by the webcam
     segments <- list(
       data.frame(Frame = 1:n_not_recorded, Clip = "not recorded")
@@ -294,7 +297,7 @@ for (id in unique(ratings$participant)) {
     }
     # (4) 5-second filler at the end of the block
     segments <- c(segments, list(data.frame(Frame = 1:150, Clip = "filler")))
-
+    
     block <- bind_rows(segments)
     block$ID <- id
     block$Condition <- cond
@@ -627,6 +630,17 @@ rating_peaks <- full_join(ratings, peaks,
 describe(rating_peaks$distance)
 
 write_processed(rating_peaks, "subjective_peaks.csv")
+
+# Peaks used in the mixed models (02_lmm_dynamic_parameters.R): every AU peak
+# associated with at least one subjective rating, counted ONCE (the same peak
+# can be the closest peak of several successive ratings).
+peaks_rating_linked <- rating_peaks %>%
+  ungroup() %>%
+  distinct(ID, Clip, Condition, AU, position, .keep_all = TRUE) %>%
+  select(ID, Clip, Condition, AU, height, position, duration, peak_start, peak_end)
+
+nrow(peaks_rating_linked)   # number of rating-linked peaks
+write_processed(peaks_rating_linked, "peaks_rating_linked.csv")
 
 
 # =============================================================================
